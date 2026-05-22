@@ -1,0 +1,192 @@
+"""
+chat_layer/ollama_client.py
+────────────────────────────
+Ollama REST API 客戶端。
+
+涵蓋：
+- 連線健康檢查
+- 串流 (streaming) 輸出 — 逐 token 列印，減少等待感
+- 非串流輸出 — 供防重複重試使用
+- 防重複引擎 (Jaccard + 重試機制)
+"""
+import json
+import urllib.request
+import urllib.error
+from typing import Dict, Generator, List, Optional
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Ollama HTTP 客戶端
+# ══════════════════════════════════════════════════════════════════════
+
+class OllamaClient:
+    """
+    使用標準庫 urllib 與 Ollama /api/chat 溝通，
+    無需安裝第三方 HTTP 套件。
+    """
+
+    def __init__(self, base_url: str, model: str):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    # ── 健康檢查 ─────────────────────────────────────────────────────
+
+    def is_available(self) -> bool:
+        """嘗試 GET /api/tags，判斷 Ollama 服務是否在線"""
+        try:
+            req = urllib.request.Request(
+                f"{self.base_url}/api/tags",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def model_exists(self) -> bool:
+        """確認指定模型已被 pull"""
+        try:
+            req = urllib.request.Request(
+                f"{self.base_url}/api/tags",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode())
+                names = [m.get("name", "") for m in data.get("models", [])]
+                # 模糊比對（避免 tag 差異，如 :latest）
+                return any(self.model in n or n.startswith(self.model) for n in names)
+        except Exception:
+            return False
+
+    # ── 核心 API 呼叫 ────────────────────────────────────────────────
+
+    def _post(self, payload: Dict, timeout: int = 120) -> urllib.request.Request:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.75,
+        max_tokens: int = 400,
+    ) -> Generator[str, None, None]:
+        """
+        串流回應產生器，每次 yield 一個 token 字串。
+        呼叫端直接 print(token, end="", flush=True) 即可即時顯示。
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "repeat_penalty": 1.15,   # 模型層面的重複懲罰
+            },
+        }
+        req = self._post(payload)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw_line in resp:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        continue
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+                    if chunk.get("done"):
+                        break
+        except urllib.error.URLError as e:
+            raise ConnectionError(f"Ollama 連線失敗: {e.reason}")
+        except TimeoutError:
+            raise ConnectionError("Ollama 回應超時（120s）")
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.75,
+        max_tokens: int = 400,
+    ) -> str:
+        """
+        非串流版本，直接回傳完整字串。
+        用於防重複重試（避免使用者看到中間失敗的串流輸出）。
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "repeat_penalty": 1.15,
+            },
+        }
+        req = self._post(payload)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data["message"]["content"]
+        except urllib.error.URLError as e:
+            raise ConnectionError(f"Ollama 連線失敗: {e.reason}")
+        except (KeyError, json.JSONDecodeError) as e:
+            raise ValueError(f"Ollama 回傳格式異常: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 防重複引擎
+# ══════════════════════════════════════════════════════════════════════
+
+def _tokenize(text: str) -> frozenset:
+    """
+    字詞級 tokenizer（中英文混合友善）。
+    中文按字拆分，英文按空格拆分，統一小寫。
+    """
+    tokens = []
+    buf = []
+    for ch in text.lower():
+        if "\u4e00" <= ch <= "\u9fff":   # CJK 字元逐字切
+            if buf:
+                tokens.extend("".join(buf).split())
+                buf.clear()
+            tokens.append(ch)
+        elif ch.isspace():
+            if buf:
+                tokens.extend("".join(buf).split())
+                buf.clear()
+        else:
+            buf.append(ch)
+    if buf:
+        tokens.extend("".join(buf).split())
+    return frozenset(tokens)
+
+
+def jaccard_similarity(a: str, b: str) -> float:
+    """計算兩字串的 Jaccard 相似度（0.0 ~ 1.0）"""
+    set_a = _tokenize(a)
+    set_b = _tokenize(b)
+    if not set_a and not set_b:
+        return 1.0
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+def is_repetitive(
+    new_response: str,
+    recent_responses: List[str],
+    threshold: float = 0.55,
+) -> bool:
+    """若新回應與任一近期回應相似度超過 threshold，視為重複"""
+    for prev in recent_responses:
+        if jaccard_similarity(new_response, prev) >= threshold:
+            return True
+    return False
