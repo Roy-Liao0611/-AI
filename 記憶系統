@@ -1,0 +1,151 @@
+"""
+chat_layer/memory.py
+─────────────────────
+JSON 對話持久化層。
+
+檔案結構：
+{
+  "session_id": "uuid4",
+  "model": "llama-3-taiwan-8b-instruct",
+  "created_at": "ISO8601",
+  "updated_at": "ISO8601",
+  "turns": [
+    {"id": 1, "timestamp": "ISO8601", "role": "user",      "content": "..."},
+    {"id": 2, "timestamp": "ISO8601", "role": "assistant", "content": "..."}
+  ]
+}
+"""
+import json
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+
+class ConversationMemory:
+    """
+    對話記憶持久化管理器。
+    每次 add_turn() 後自動存檔，確保 crash 不遺失對話。
+    """
+
+    def __init__(self, memory_file: Path, model: str, max_context_turns: int = 16):
+        self._file = memory_file
+        self._model = model
+        self._max_context_turns = max_context_turns
+        self._data: Dict[str, Any] = self._load_or_init()
+
+    # ── 載入 / 初始化 ────────────────────────────────────────────────
+
+    def _load_or_init(self) -> Dict[str, Any]:
+        if self._file.exists():
+            try:
+                data = json.loads(self._file.read_text(encoding="utf-8"))
+                # 基本結構健全性檢查
+                if isinstance(data.get("turns"), list):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass  # 損毀時建立新 session
+        return self._new_session()
+
+    def _new_session(self) -> Dict[str, Any]:
+        return {
+            "session_id": str(uuid.uuid4()),
+            "model": self._model,
+            "created_at": _now(),
+            "updated_at": _now(),
+            "turns": [],
+        }
+
+    # ── 寫入 ─────────────────────────────────────────────────────────
+
+    def add_turn(self, role: str, content: str) -> None:
+        """新增一輪對話並立即存檔"""
+        if role not in ("user", "assistant", "system"):
+            raise ValueError(f"不允許的 role: {role!r}")
+        self._data["turns"].append({
+            "id": len(self._data["turns"]) + 1,
+            "timestamp": _now(),
+            "role": role,
+            "content": content,
+        })
+        self._persist()
+
+    def clear(self) -> None:
+        """清除所有對話歷史，開啟新 session"""
+        self._data = self._new_session()
+        self._persist()
+
+    def _persist(self) -> None:
+        self._data["updated_at"] = _now()
+        try:
+            self._file.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            # 存檔失敗不中斷對話，僅警告
+            print(f"⚠️  記憶體存檔失敗: {e}")
+
+    # ── 讀取 ─────────────────────────────────────────────────────────
+
+    def get_context_messages(self) -> List[Dict[str, str]]:
+        """
+        回傳最近 max_context_turns 條 user/assistant 訊息，
+        格式符合 Ollama /api/chat messages 欄位。
+        注意：system prompt 由呼叫方自行加在最前面。
+        """
+        turns = self._data["turns"]
+        # 只取 user / assistant（排除 system，由 caller 注入）
+        filtered = [t for t in turns if t["role"] in ("user", "assistant")]
+        # 取最後 N 條（保持偶數，user/assistant 成對）
+        n = self._max_context_turns
+        if len(filtered) > n:
+            # 確保從 user 開始（避免 assistant 孤立開頭）
+            chunk = filtered[-n:]
+            if chunk and chunk[0]["role"] == "assistant":
+                chunk = chunk[1:]
+            filtered = chunk
+        return [{"role": t["role"], "content": t["content"]} for t in filtered]
+
+    def get_recent_assistant_responses(self, n: int) -> List[str]:
+        """回傳最近 n 條 AI 回應文字，供防重複檢查使用"""
+        responses = [
+            t["content"]
+            for t in self._data["turns"]
+            if t["role"] == "assistant"
+        ]
+        return responses[-n:] if len(responses) > n else responses
+
+    # ── 統計資訊 ─────────────────────────────────────────────────────
+
+    @property
+    def session_id(self) -> str:
+        return self._data["session_id"]
+
+    @property
+    def total_turns(self) -> int:
+        """所有輪數（user + assistant）"""
+        return len(self._data["turns"])
+
+    @property
+    def exchange_count(self) -> int:
+        """完整來回對話次數"""
+        return self.total_turns // 2
+
+    @property
+    def created_at(self) -> str:
+        return self._data["created_at"]
+
+    def summary(self) -> str:
+        return (
+            f"Session : {self.session_id}\n"
+            f"建立時間 : {self.created_at}\n"
+            f"對話次數 : {self.exchange_count} 輪\n"
+            f"記憶檔案 : {self._file}"
+        )
+
+
+# ── 工具函式 ─────────────────────────────────────────────────────────
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
