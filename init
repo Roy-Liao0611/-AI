@@ -1,0 +1,14 @@
+# chat_layer/__init__.py
+# 讓 chat_layer 可作為 package 被 import
+from .config import ChatConfig, DEFAULT_CONFIG
+from .memory import ConversationMemory
+from .ollama_client import OllamaClient, is_repetitive, jaccard_similarity
+
+__all__ = [
+    "ChatConfig",
+    "DEFAULT_CONFIG",
+    "ConversationMemory",
+    "OllamaClient",
+    "is_repetitive",
+    "jaccard_similarity",
+]
