@@ -1,0 +1,420 @@
+import os
+import json
+import logging
+import shlex
+import re
+from typing import List, Dict, Any, Callable, Optional
+from pathlib import Path
+
+# =====================================================================
+# 0. 日誌與環境初始化
+# =====================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("AIBaseSystem")
+
+BASE_DIR = Path(__file__).parent.resolve()
+SANDBOX_DIR = BASE_DIR / "sandbox"
+SANDBOX_DIR.mkdir(exist_ok=True)
+
+
+# =====================================================================
+# 1. 安全沙盒層 (Security Sandbox)
+# =====================================================================
+class SecuritySandbox:
+    """
+    修復項目：
+    V-1: shell=True → shell=False + shlex.split()，徹底防止 Shell 注入
+    V-2: startswith 字串比對 → Path.relative_to()，防止前綴路徑欺騙
+    V-3: 新增對絕對路徑輸入的明確拒絕
+    新增: Shell 特殊字元過濾層
+    """
+
+    # 白名單改為 frozenset，查找 O(1) 且不可變，防止執行中被篡改
+    ALLOWED_BASE_COMMANDS: frozenset = frozenset({"echo", "ls", "git"})
+
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir.resolve()
+
+    def validate_path(self, target_path: str) -> Path:
+        """
+        [V-2 修復] 使用 Path.relative_to() 取代 startswith 字串比對。
+        [V-3 修復] 明確拒絕絕對路徑輸入，防止 Path(root) / '/etc/passwd' 繞過。
+        """
+        # 拒絕絕對路徑輸入（Python 的 Path 在接收絕對路徑時會忽略前綴）
+        if Path(target_path).is_absolute():
+            raise PermissionError(
+                f"安全阻斷：禁止輸入絕對路徑 {target_path!r}"
+            )
+
+        # 解析為真實絕對路徑（解開符號連結與 ../）
+        full_path = Path(os.path.realpath(self.root_dir / target_path))
+
+        # [V-2 修復] relative_to() 做精確目錄邊界比對，而非字串前綴
+        # /sandbox-evil 不會通過 /sandbox 的 relative_to 檢查
+        try:
+            full_path.relative_to(self.root_dir)
+        except ValueError:
+            raise PermissionError(
+                f"安全阻斷：企圖逃逸沙盒 {target_path!r}"
+            )
+
+        return full_path
+
+    def safe_execute_command(self, cmd: str) -> str:
+        """
+        [V-1 修復] 使用 shell=False 搭配 shlex.split()，
+        即使 echo; rm -rf / 也只會被當成 ['echo', ';', 'rm', '-rf', '/'] 的參數，
+        Shell 不會介入解析，注入失效。
+
+        新增 Shell 元字元過濾作為第一道防線。
+        """
+        # 防線一：過濾 Shell 元字元（; | & $ ` 等）
+        _SHELL_METACHAR_RE = re.compile(r'[;|&$`(){}\[\]<>!\\\'"]')
+        if _SHELL_METACHAR_RE.search(cmd):
+            raise PermissionError(
+                f"安全阻斷：指令含有不允許的 Shell 特殊字元 {cmd!r}"
+            )
+
+        # 防線二：解析指令 token
+        try:
+            parts = shlex.split(cmd)
+        except ValueError as e:
+            raise PermissionError(f"安全阻斷：無法解析指令 {cmd!r}: {e}")
+
+        if not parts:
+            raise PermissionError("安全阻斷：空指令")
+
+        base_cmd = parts[0]
+
+        # 防線三：白名單比對（基礎指令）
+        if base_cmd not in self.ALLOWED_BASE_COMMANDS:
+            raise PermissionError(
+                f"安全阻斷：不允許執行指令 {base_cmd!r}"
+            )
+
+        import subprocess
+        try:
+            result = subprocess.run(
+                parts,          # [V-1] 傳入 list
+                shell=False,    # [V-1 核心修復] 關閉 Shell 解析
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=self.root_dir,
+            )
+            output = result.stdout if result.returncode == 0 else result.stderr
+            # 截斷過長輸出，防止記憶體攻擊
+            return output[:4096]
+        except subprocess.TimeoutExpired:
+            return "指令執行超時（10 秒）"
+        except Exception as e:
+            # 不對外暴露詳細錯誤，僅記錄 log
+            logger.error(f"指令執行例外: {type(e).__name__}: {e}")
+            return f"指令執行失敗: {type(e).__name__}"
+
+
+sandbox_env = SecuritySandbox(SANDBOX_DIR)
+
+
+# =====================================================================
+# 2. Schema 驗證器 (Tool Argument Validator)
+# =====================================================================
+class SchemaValidator:
+    """
+    [V-4 修復] 在工具執行前做參數型別與必填欄位驗證。
+    輕量實作，避免引入 jsonschema 外部依賴。
+    """
+
+    TYPE_MAP: Dict[str, type] = {
+        "string": str,
+        "integer": int,
+        "number": (int, float),
+        "boolean": bool,
+        "array": list,
+        "object": dict,
+    }
+
+    @classmethod
+    def validate(cls, schema: Dict[str, Any], data: Dict[str, Any]) -> None:
+        """驗證 data 符合 schema，不符合則拋出 ValueError"""
+        required = schema.get("required", [])
+        properties = schema.get("properties", {})
+
+        # 檢查必填欄位
+        for field in required:
+            if field not in data:
+                raise ValueError(f"缺少必填參數: {field!r}")
+
+        # 檢查型別
+        for key, value in data.items():
+            if key not in properties:
+                raise ValueError(f"不允許的未知參數: {key!r}")
+            expected_type_str = properties[key].get("type", "string")
+            expected_type = cls.TYPE_MAP.get(expected_type_str)
+            if expected_type and not isinstance(value, expected_type):
+                raise ValueError(
+                    f"參數 {key!r} 型別錯誤: 期望 {expected_type_str}, "
+                    f"收到 {type(value).__name__}"
+                )
+            # 字串長度上限，防止超大 payload
+            if isinstance(value, str) and len(value) > 1_000_000:
+                raise ValueError(f"參數 {key!r} 超過字串長度上限 (1MB)")
+
+
+# =====================================================================
+# 3. 工具系統 (Tool System)
+# =====================================================================
+class ToolRegistry:
+    def __init__(self):
+        self._tools: Dict[str, Dict[str, Any]] = {}
+
+    def register(self, name: str, description: str, schema: Dict[str, Any]):
+        def decorator(func: Callable) -> Callable:
+            self._tools[name] = {
+                "func": func,
+                "description": description,
+                "schema": schema,
+            }
+            return func
+        return decorator
+
+    def execute(self, name: str, kwargs: Dict[str, Any]) -> str:
+        if name not in self._tools:
+            return f"Error: Tool '{name}' 不存在。"
+
+        tool = self._tools[name]
+
+        # [V-4 修復] 執行前做 Schema 驗證
+        try:
+            SchemaValidator.validate(tool["schema"], kwargs)
+        except ValueError as e:
+            logger.warning(f"工具 {name!r} 參數驗證失敗: {e}")
+            return f"參數驗證錯誤: {e}"
+
+        # 日誌遮蔽敏感欄位 (content 可能含大量資料)
+        safe_log_kwargs = {
+            k: (f"<{len(v)} chars>" if k == "content" and isinstance(v, str) else v)
+            for k, v in kwargs.items()
+        }
+        logger.info(f"執行工具: {name} | 參數: {safe_log_kwargs}")
+
+        try:
+            return tool["func"](**kwargs)
+        except PermissionError as e:
+            # 安全阻斷事件，記錄 WARNING 而非 ERROR
+            logger.warning(f"[安全阻斷] 工具 {name}: {e}")
+            return f"安全阻斷: {e}"
+        except Exception as e:
+            logger.error(f"工具 {name} 執行例外: {type(e).__name__}: {e}")
+            return f"執行錯誤: {type(e).__name__}"
+
+
+tool_registry = ToolRegistry()
+
+
+# ---- 具體工具實作 ----
+@tool_registry.register(
+    name="write_file",
+    description="在沙盒內寫入或建立檔案",
+    schema={
+        "type": "object",
+        "properties": {
+            "filename": {"type": "string", "description": "相對沙盒的檔名"},
+            "content":  {"type": "string", "description": "檔案內容"},
+        },
+        "required": ["filename", "content"],
+    },
+)
+def write_file(filename: str, content: str) -> str:
+    safe_path = sandbox_env.validate_path(filename)
+    safe_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_path.write_text(content, encoding="utf-8")
+    logger.info(f"寫入檔案: {filename} ({len(content)} chars)")
+    return f"成功寫入: {filename}"
+
+
+@tool_registry.register(
+    name="read_file",
+    description="讀取沙盒內的檔案內容",
+    schema={
+        "type": "object",
+        "properties": {
+            "filename": {"type": "string", "description": "相對沙盒的檔名"},
+        },
+        "required": ["filename"],
+    },
+)
+def read_file(filename: str) -> str:
+    safe_path = sandbox_env.validate_path(filename)
+    if not safe_path.exists():
+        return f"錯誤：{filename} 不存在"
+    content = safe_path.read_text(encoding="utf-8")
+    # 截斷過長內容
+    return content[:8192] if len(content) > 8192 else content
+
+
+@tool_registry.register(
+    name="execute_system_command",
+    description="執行受限的白名單系統指令",
+    schema={
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "欲執行的白名單指令"},
+        },
+        "required": ["command"],
+    },
+)
+def execute_system_command(command: str) -> str:
+    return sandbox_env.safe_execute_command(command)
+
+
+# =====================================================================
+# 4. LLM 門戶層 (MockLLMAdapter)
+# =====================================================================
+class MockLLMAdapter:
+    """
+    架構驗證用 Mock，模擬 AI 決策鏈：
+    寫入 → 讀取確認 → 嘗試路徑逃逸（應被阻斷）→ 完成
+    """
+
+    def __init__(self):
+        self._step = 0
+
+    def chat(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        self._step += 1
+        steps = {
+            1: {
+                "role": "assistant",
+                "content": "思考：使用 write_file 建立報告。",
+                "tool_calls": [{
+                    "name": "write_file",
+                    "arguments": {
+                        "filename": "report.txt",
+                        "content": "Hello Local AI Sandbox!",
+                    }
+                }],
+            },
+            2: {
+                "role": "assistant",
+                "content": "思考：讀取報告確認寫入正確。",
+                "tool_calls": [{
+                    "name": "read_file",
+                    "arguments": {"filename": "report.txt"},
+                }],
+            },
+            3: {
+                "role": "assistant",
+                "content": "思考：[安全測試] 嘗試讀取沙盒外敏感路徑。",
+                "tool_calls": [{
+                    "name": "read_file",
+                    "arguments": {"filename": "../../../etc/passwd"},
+                }],
+            },
+            4: {
+                "role": "assistant",
+                "content": "思考：[安全測試] 嘗試執行帶有 Shell 注入的指令。",
+                "tool_calls": [{
+                    "name": "execute_system_command",
+                    "arguments": {"command": "echo hello; cat /etc/passwd"},
+                }],
+            },
+        }
+        if self._step in steps:
+            return steps[self._step]
+        return {
+            "role": "assistant",
+            "content": (
+                "任務完成。\n"
+                "✅ 報告建立成功\n"
+                "✅ 讀取驗證成功\n"
+                "🛡️ 路徑逃逸攻擊被成功阻斷\n"
+                "🛡️ Shell 注入攻擊被成功阻斷"
+            ),
+            "tool_calls": None,
+        }
+
+
+# =====================================================================
+# 5. Agent 核心循環 (Agent Engine)
+# =====================================================================
+class AgentEngine:
+    """
+    [V-4 修復] 新增 max_memory_turns 限制，防止記憶體無限增長。
+    """
+
+    def __init__(
+        self,
+        llm_adapter: MockLLMAdapter,
+        registry: ToolRegistry,
+        max_loops: int = 10,
+        max_memory_turns: int = 50,
+    ):
+        self._llm = llm_adapter
+        self._registry = registry
+        self._max_loops = max_loops
+        self._max_memory_turns = max_memory_turns
+        self._memory: List[Dict[str, Any]] = []
+
+    def _trim_memory(self) -> None:
+        """保留最後 max_memory_turns 條記錄（始終保留第一條 user 訊息）"""
+        if len(self._memory) > self._max_memory_turns:
+            # 保留 system/首則訊息 + 最新的 N 條
+            head = self._memory[:1]
+            tail = self._memory[-(self._max_memory_turns - 1):]
+            self._memory = head + tail
+            logger.info("記憶體裁剪完成，防止無限增長。")
+
+    def run(self, user_prompt: str) -> None:
+        logger.info(f"啟動 Agent 任務: {user_prompt!r}")
+        self._memory.append({"role": "user", "content": user_prompt})
+
+        for loop_count in range(1, self._max_loops + 1):
+            logger.info(f"=== [Loop {loop_count}/{self._max_loops}] Plan-Act-Observe ===")
+
+            # Plan
+            response = self._llm.chat(self._memory)
+            self._memory.append(response)
+            self._trim_memory()
+
+            print(f"\n[AI]: {response['content']}")
+
+            tool_calls: Optional[List[Dict]] = response.get("tool_calls")
+            if not tool_calls:
+                logger.info("AI 確認任務完成。")
+                break
+
+            # Act & Observe
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name", "")
+                args = tool_call.get("arguments", {})
+
+                if not isinstance(args, dict):
+                    observation = "錯誤：工具參數格式非 dict"
+                else:
+                    observation = self._registry.execute(tool_name, args)
+
+                print(f"[Observation] {tool_name}: {observation}")
+
+                self._memory.append({
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": observation,
+                })
+        else:
+            logger.warning("達到最大循環次數，強制終止。")
+
+
+# =====================================================================
+# 6. 執行 Entrypoint
+# =====================================================================
+if __name__ == "__main__":
+    print("=" * 52)
+    print("  Local Secure AI Agent Base System — Python")
+    print("=" * 52)
+
+    llm_service = MockLLMAdapter()
+    agent = AgentEngine(llm_service, tool_registry)
+    agent.run("請建立一份安全報告，並驗證沙盒防禦機制。")
