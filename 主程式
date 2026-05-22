@@ -1,0 +1,336 @@
+"""
+chat_layer/chat.py
+───────────────────
+CLI 主循環。執行方式：
+
+    python chat_layer/chat.py
+    python chat_layer/chat.py --model llama3          # 覆蓋模型
+    python chat_layer/chat.py --reset                 # 清除記憶後啟動
+    python chat_layer/chat.py --memory my_chat.json   # 指定記憶體檔案
+
+對話中可用指令（輸入時以 / 開頭）：
+    /help      顯示指令列表
+    /clear     清除本 session 對話記憶
+    /history   列印對話紀錄摘要
+    /session   顯示 session 詳細資訊
+    /quit      離開（也可按 Ctrl+C）
+"""
+import argparse
+import sys
+from pathlib import Path
+from typing import List, Dict
+
+# 同套件相對引入（直接執行時用絕對 import）
+try:
+    from .config import ChatConfig, DEFAULT_CONFIG
+    from .memory import ConversationMemory
+    from .ollama_client import OllamaClient, is_repetitive
+except ImportError:
+    from config import ChatConfig, DEFAULT_CONFIG        # type: ignore
+    from memory import ConversationMemory               # type: ignore
+    from ollama_client import OllamaClient, is_repetitive  # type: ignore
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 終端樣式（ANSI，部分終端不支援時會 fallback 成純文字）
+# ══════════════════════════════════════════════════════════════════════
+
+class _C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    GREEN  = "\033[32m"
+    CYAN   = "\033[36m"
+    YELLOW = "\033[33m"
+    RED    = "\033[31m"
+    GREY   = "\033[90m"
+
+
+def _c(color: str, text: str) -> str:
+    """包裹 ANSI 色彩，若不支援則直接回傳文字"""
+    try:
+        import os
+        if not sys.stdout.isatty() or os.name == "nt":
+            return text
+    except Exception:
+        return text
+    return f"{color}{text}{_C.RESET}"
+
+
+BANNER = f"""
+{_c(_C.CYAN + _C.BOLD, '╔══════════════════════════════════════════════╗')}
+{_c(_C.CYAN + _C.BOLD, '║')}  💎  {_c(_C.BOLD, 'Local Chat AI')}  ─  Ollama + Gemma 3 1B    {_c(_C.CYAN + _C.BOLD, '║')}
+{_c(_C.CYAN + _C.BOLD, '║')}  {_c(_C.DIM, '/help 查看指令　　　Ctrl+C 離開')}            {_c(_C.CYAN + _C.BOLD, '║')}
+{_c(_C.CYAN + _C.BOLD, '╚══════════════════════════════════════════════╝')}
+"""
+
+COMMANDS: Dict[str, str] = {
+    "/help":    "顯示此說明",
+    "/clear":   "清除對話記憶，開始新 session",
+    "/history": "顯示本 session 對話摘要",
+    "/session": "顯示 session ID 與統計資訊",
+    "/quit":    "離開程式",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ChatCLI
+# ══════════════════════════════════════════════════════════════════════
+
+class ChatCLI:
+    def __init__(self, config: ChatConfig):
+        self.cfg = config
+        self.memory = ConversationMemory(
+            memory_file=config.memory_file,
+            model=config.model,
+            max_context_turns=config.max_context_turns,
+        )
+        self.client = OllamaClient(
+            base_url=config.ollama_base_url,
+            model=config.model,
+        )
+
+    # ── 訊息組裝 ─────────────────────────────────────────────────────
+
+    def _build_messages(
+        self, extra_system: str = ""
+    ) -> List[Dict[str, str]]:
+        """
+        組裝送進 Ollama 的 messages 陣列：
+        [system] + [歷史對話]
+        """
+        system_content = self.cfg.system_prompt
+        if extra_system:
+            system_content += f"\n{extra_system}"
+        messages = [{"role": "system", "content": system_content}]
+        messages.extend(self.memory.get_context_messages())
+        return messages
+
+    # ── 回應生成（含防重複） ─────────────────────────────────────────
+
+    def _generate(self, user_input: str) -> str:
+        """
+        核心生成流程：
+        1. 先以串流模式取得第一次回應（好的 UX）
+        2. 若偵測到重複，靜默重試（非串流），印出最終結果
+        3. 最多重試 max_retries 次
+        """
+        # 加入使用者訊息（先不存檔，等確認 AI 回應後一起存）
+        self.memory.add_turn("user", user_input)
+        recent_ai = self.memory.get_recent_assistant_responses(
+            self.cfg.recent_turns_to_check
+        )
+
+        temperature = self.cfg.temperature
+        response = ""
+        is_first_attempt = True
+
+        for attempt in range(self.cfg.max_retries + 1):
+            extra = ""
+            if attempt > 0:
+                # 重試時加入額外提示
+                extra = "請用完全不同的角度或措辭來回應，不要重複剛才的說法。"
+
+            messages = self._build_messages(extra_system=extra)
+
+            if is_first_attempt:
+                # ── 第一次：串流輸出（即時顯示） ──
+                print(_c(_C.GREEN, "AI："), end="", flush=True)
+                collected: List[str] = []
+                try:
+                    for token in self.client.chat_stream(
+                        messages, temperature=temperature,
+                        max_tokens=self.cfg.max_tokens,
+                    ):
+                        print(token, end="", flush=True)
+                        collected.append(token)
+                except ConnectionError as e:
+                    print()
+                    raise e
+                print()   # 換行
+                response = "".join(collected).strip()
+                is_first_attempt = False
+            else:
+                # ── 重試：非串流，靜默取得 ──
+                print(_c(_C.YELLOW, "⟳  重新生成中…"), end="\r", flush=True)
+                try:
+                    response = self.client.chat(
+                        messages, temperature=temperature,
+                        max_tokens=self.cfg.max_tokens,
+                    ).strip()
+                except ConnectionError as e:
+                    print()
+                    raise e
+                # 清除「重新生成中」提示行，印出新回應
+                print(" " * 20, end="\r")
+                print(_c(_C.GREEN, "AI：") + response)
+
+            # ── 防重複檢查 ──
+            if not is_repetitive(response, recent_ai, self.cfg.repetition_threshold):
+                break   # 通過，結束重試
+
+            temperature = min(temperature + self.cfg.temperature_boost, 1.0)
+            # 把當前重複回應加入 recent_ai 讓下次比對更嚴格
+            recent_ai.append(response)
+
+        # 將最終 AI 回應存入記憶體
+        self.memory.add_turn("assistant", response)
+        return response
+
+    # ── 指令處理 ─────────────────────────────────────────────────────
+
+    def _handle_command(self, cmd: str) -> bool:
+        """
+        處理 / 指令。
+        回傳 True = 繼續對話；False = 結束程式。
+        """
+        cmd_lower = cmd.strip().lower()
+
+        if cmd_lower == "/quit":
+            print(_c(_C.DIM, "再見！對話記錄已自動儲存。"))
+            return False
+
+        elif cmd_lower == "/clear":
+            self.memory.clear()
+            print(_c(_C.YELLOW, "✓ 記憶已清除，開啟新 session。"))
+
+        elif cmd_lower == "/history":
+            msgs = self.memory.get_context_messages()
+            if not msgs:
+                print(_c(_C.DIM, "  （目前沒有對話記錄）"))
+            else:
+                print(_c(_C.BOLD, f"\n── 對話記錄（最近 {len(msgs)} 條）──"))
+                for m in msgs:
+                    prefix = _c(_C.CYAN,  "  你：") if m["role"] == "user" \
+                        else _c(_C.GREEN, "  AI：")
+                    preview = m["content"][:90]
+                    suffix = "…" if len(m["content"]) > 90 else ""
+                    print(f"{prefix}{preview}{suffix}")
+                print()
+
+        elif cmd_lower == "/session":
+            print()
+            for line in self.memory.summary().splitlines():
+                print(_c(_C.DIM, f"  {line}"))
+            print()
+
+        elif cmd_lower == "/help":
+            print(_c(_C.BOLD, "\n── 可用指令 ──"))
+            for c, desc in COMMANDS.items():
+                print(f"  {_c(_C.CYAN, c):<20} {desc}")
+            print()
+
+        else:
+            print(_c(_C.RED, f"未知指令 {cmd!r}，輸入 /help 查看可用指令。"))
+
+        return True
+
+    # ── 主循環 ───────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        print(BANNER)
+
+        # ── 連線檢查 ──
+        if not self.client.is_available():
+            print(_c(_C.RED,
+                f"✗ 無法連線到 Ollama（{self.cfg.ollama_base_url}）\n"
+                f"  請先執行：ollama serve"
+            ))
+            sys.exit(1)
+
+        if not self.client.model_exists():
+            print(_c(_C.YELLOW,
+                f"⚠  模型 {self.cfg.model!r} 尚未下載，正在嘗試拉取…\n"
+                f"   （或手動執行：ollama pull {self.cfg.model}）"
+            ))
+            # 不中斷，讓 Ollama 在第一次呼叫時自動拉取
+
+        # ── 啟動資訊 ──
+        print(_c(_C.GREEN,  f"✓ Ollama 已連線"))
+        print(_c(_C.DIM,    f"  模型：{self.cfg.model}"))
+        print(_c(_C.DIM,    f"  記憶：{self.cfg.memory_file}"))
+        if self.memory.exchange_count > 0:
+            print(_c(_C.DIM,
+                f"  載入 {self.memory.exchange_count} 輪歷史對話"
+            ))
+        print()
+
+        # ── 對話主循環 ──
+        while True:
+            try:
+                user_input = input(_c(_C.BOLD, "你：")).strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                print(_c(_C.DIM, "再見！對話記錄已自動儲存。"))
+                break
+
+            if not user_input:
+                continue
+
+            # 指令分流
+            if user_input.startswith("/"):
+                if not self._handle_command(user_input):
+                    break
+                continue
+
+            # 生成回應
+            try:
+                self._generate(user_input)
+                print()   # 回應後空一行，增加可讀性
+            except ConnectionError as e:
+                print(_c(_C.RED, f"\n✗ 連線錯誤：{e}"))
+            except Exception as e:
+                print(_c(_C.RED, f"\n✗ 發生錯誤：{type(e).__name__}: {e}"))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CLI 入口
+# ══════════════════════════════════════════════════════════════════════
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Local Chat AI — Ollama + Gemma 3 1B",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help=f"覆蓋模型名稱（預設：{DEFAULT_CONFIG.model}）",
+    )
+    parser.add_argument(
+        "--memory", default=None, type=Path,
+        help="指定記憶體 JSON 檔案路徑",
+    )
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="啟動前先清除所有對話記憶",
+    )
+    parser.add_argument(
+        "--url", default=None,
+        help=f"覆蓋 Ollama URL（預設：{DEFAULT_CONFIG.ollama_base_url}）",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    # 依 CLI 參數組裝 config
+    config = ChatConfig()
+    if args.model:
+        config.model = args.model
+    if args.memory:
+        config.memory_file = args.memory
+    if args.url:
+        config.ollama_base_url = args.url
+
+    cli = ChatCLI(config)
+
+    if args.reset:
+        cli.memory.clear()
+        print(_c(_C.YELLOW, "✓ 記憶已重置。"))
+
+    cli.run()
+
+
+if __name__ == "__main__":
+    main()
